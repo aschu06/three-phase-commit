@@ -18,8 +18,28 @@ This project implements a distributed transaction system using the Three-Phase C
 - Mutexes
 - Transaction logging
 
-## What I Learned
-- How distributed transactions are coordinated
-- Why locking is needed for consistency
-- How commit protocols handle failure cases
-- How to manage shared state safely in Go
+## How to Run
+
+### Prerequisites
+- Go installed (version 1.18+ recommended)
+
+### Steps
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/three-phase-commit.git
+cd three-phase-commit
+
+# Start servers (open separate terminals)
+
+# Coordinator
+go run main.go --role=coordinator --port=8000
+
+# Participant 1
+go run main.go --role=participant --id=1 --port=8001
+
+# Participant 2
+go run main.go --role=participant --id=2 --port=8002
+
+# Run a client transaction (in another terminal)
+go run client.go
