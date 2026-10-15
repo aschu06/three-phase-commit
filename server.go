@@ -54,6 +54,17 @@ func (sv *Server) Prepare(args *RPCArgs, reply *PrepareReply) {
 	} else {
 		reply.Relevant = true
 	}
+	state := sv.transactions[tid].state
+	if state == stateVotedYes || state == statePreCommitted || state == stateCommitted { //already voted yes (e.g. a recovered coordinator re-sent Prepare), we still hold the locks so vote yes again
+		reply.VotedFor = true
+		sv.mu.Unlock()
+		return
+	}
+	if state == stateVotedNo || state == stateAborted { //already voted no or aborted, so vote no again
+		reply.VotedFor = false
+		sv.mu.Unlock()
+		return
+	}
 
 	for i := 0; i < len(sv.transactions[tid].ops); i++ { //go through all operations for keys
 		if sv.transactions[tid].ops[i].op == true { //get operation, need tryRlock

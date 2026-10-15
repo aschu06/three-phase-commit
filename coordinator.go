@@ -2,7 +2,9 @@ package commit
 
 import (
 	"cs351/labrpc"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Responses to the client
@@ -16,27 +18,31 @@ type Coordinator struct {
 	servers  []*labrpc.ClientEnd
 	respChan chan ResponseMsg
 	dead     int32
-	// Your fields here
+
+	mu     sync.Mutex
+	active map[int]bool //transactions this coordinator is already running, so recovery doesn't start them twice
 }
 
 // Start the 3PC protocol for a particular transaction
 // This may be called concurrently
 func (co *Coordinator) FinishTransaction(tid int) {
-	// Your code here
-
+	co.mu.Lock()
+	co.active[tid] = true
+	co.mu.Unlock()
 	//prepare, precommit, commit
+	co.doPrepare(tid)
+}
 
+// Prepare phase: ask every server to vote, then move on to PreCommit or abort
+func (co *Coordinator) doPrepare(tid int) {
 	prepareYes := true
-	precommitYes := true
-
-	//prepare
 	serversToSend := []int{}               //create list of servers we should send precommit and commit to
 	for i := 0; i < len(co.servers); i++ { //i is the server
 		if prepareYes == true { //while still valid
 			args := &RPCArgs{Tid: tid}
 			reply := &PrepareReply{}
 			response := co.sendPrepare(i, args, reply)
-			if response == false { //if prepare retruned false or timed out
+			if response == false { //if prepare returned false or timed out
 				prepareYes = false
 			} else {
 				if reply.VotedFor == false {
@@ -48,53 +54,49 @@ func (co *Coordinator) FinishTransaction(tid int) {
 			}
 		}
 	}
-	if prepareYes == false { //if prepre fail
-		for i := 0; i < len(co.servers); i++ {
-			args := &RPCArgs{Tid: tid}
-			co.sendAbort(i, args) //we abort
-			// for response == false {           //continue to send aborts until it successfully aborts
-			// 	response = co.sendAbort(i, args)
-			// }
-		}
-		co.respChan <- ResponseMsg{tid: tid, committed: false, readValues: nil}
+	if co.killed() { //coordinator crashed mid-phase, recovery on the new coordinator takes over
 		return
 	}
+	if prepareYes == false { //if prepare fail
+		co.doAbort(tid)
+		return
+	}
+	co.doPreCommit(tid, serversToSend)
+}
 
-	//precommit
+// PreCommit phase: send PreCommit to relevant servers, then move on to Commit or abort
+func (co *Coordinator) doPreCommit(tid int, servers []int) {
+	precommitYes := true
 	args := &RPCArgs{Tid: tid}
-	for i := 0; i < len(serversToSend); i++ {
+	for i := 0; i < len(servers); i++ {
 		if precommitYes == true {
-			response := co.sendPreCommit(serversToSend[i], args)
+			response := co.sendPreCommit(servers[i], args)
 			if response == false {
 				precommitYes = false
 			}
 		}
 	}
-	if precommitYes == false { //if prepare fail
-		for i := 0; i < len(co.servers); i++ {
-			args := &RPCArgs{Tid: tid}
-			co.sendAbort(i, args)
-
-			// for response == false { //continue to send aborts until it successfully aborts
-			// 	response = co.sendAbort(i, args)
-			// }
-		}
-		co.respChan <- ResponseMsg{tid: tid, committed: false, readValues: nil}
+	if co.killed() {
 		return
 	}
+	if precommitYes == false { //if precommit fail
+		co.doAbort(tid)
+		return
+	}
+	co.doCommit(tid, servers)
+}
 
-	//commit
+// Commit phase: resend Commit until each relevant server responds, then report success
+func (co *Coordinator) doCommit(tid int, servers []int) {
 	outputs := make(map[string]interface{})
-	for i := 0; i < len(serversToSend); i++ {
+	for i := 0; i < len(servers); i++ {
 		args := &RPCArgs{Tid: tid}
 		reply := &CommitReply{}
-		response := co.sendCommit(serversToSend[i], args, reply)
-		// if response == false { //keep trying to commit until it goes through
-		// 	response = co.sendCommit(serversToSend[i], args, reply)
-		// }
-		for response == false && co.killed() == false{	//keep resending commit until the server responds
+		response := co.sendCommit(servers[i], args, reply)
+		for response == false && co.killed() == false { //keep resending commit until the server responds
+			time.Sleep(10 * time.Millisecond)
 			reply = &CommitReply{}
-			response = co.sendCommit(serversToSend[i], args, reply)
+			response = co.sendCommit(servers[i], args, reply)
 		}
 		if response == true {
 			for j := range reply.Results {
@@ -102,8 +104,98 @@ func (co *Coordinator) FinishTransaction(tid int) {
 			}
 		}
 	}
+	if co.killed() {
+		return
+	}
 	co.respChan <- ResponseMsg{tid: tid, committed: true, readValues: outputs}
+}
 
+// Abort: report the abort to the client, then resend Abort to every server until it responds
+func (co *Coordinator) doAbort(tid int) {
+	if co.killed() {
+		return
+	}
+	co.respChan <- ResponseMsg{tid: tid, committed: false, readValues: nil} //no need to wait for disconnected servers, the outcome is already decided
+	args := &RPCArgs{Tid: tid}
+	for i := 0; i < len(co.servers); i++ {
+		response := co.sendAbort(i, args)
+		for response == false && co.killed() == false { //keep resending abort until the server responds
+			time.Sleep(10 * time.Millisecond)
+			response = co.sendAbort(i, args)
+		}
+	}
+}
+
+// Recovery: query every server for the state of each transaction it knows about,
+// then resume each unfinished transaction from the right phase
+func (co *Coordinator) recover() {
+	//states[tid][server] = that server's state for the transaction
+	states := make(map[int]map[int]TransactionState)
+	for i := 0; i < len(co.servers); i++ {
+		reply := &QueryReply{}
+		response := co.sendQuery(i, reply)
+		for response == false && co.killed() == false { //keep resending query until the server responds
+			time.Sleep(10 * time.Millisecond)
+			reply = &QueryReply{}
+			response = co.sendQuery(i, reply)
+		}
+		if co.killed() {
+			return
+		}
+		for tid, state := range reply.States {
+			if states[tid] == nil {
+				states[tid] = make(map[int]TransactionState)
+			}
+			states[tid][i] = state
+		}
+	}
+
+	//only resume transactions after every server has been queried
+	for tid, serverStates := range states {
+		servers := []int{} //servers that know about a transaction are the relevant ones
+		anyAbort, allAborted, anyCommitted, allCommitted, anyPreCommitted, anyVotedYes := false, true, false, true, false, false
+		for server, state := range serverStates {
+			servers = append(servers, server)
+			if state == stateVotedNo || state == stateAborted {
+				anyAbort = true
+			}
+			if state != stateAborted {
+				allAborted = false
+			}
+			if state == stateCommitted {
+				anyCommitted = true
+			} else {
+				allCommitted = false
+			}
+			if state == statePreCommitted {
+				anyPreCommitted = true
+			}
+			if state == stateVotedYes {
+				anyVotedYes = true
+			}
+		}
+
+		co.mu.Lock()
+		alreadyRunning := co.active[tid] //started on this coordinator by FinishTransaction while we were querying
+		co.active[tid] = true
+		co.mu.Unlock()
+		if alreadyRunning {
+			continue
+		}
+
+		//apply the recovery rules in order
+		if anyAbort {
+			if !allAborted { //if every server already aborted, the transaction is finished
+				go co.doAbort(tid)
+			}
+		} else if anyCommitted && !allCommitted {
+			go co.doCommit(tid, servers)
+		} else if anyPreCommitted {
+			go co.doPreCommit(tid, servers)
+		} else if anyVotedYes {
+			go co.doPrepare(tid)
+		}
+	}
 }
 
 // Initialize new Coordinator
@@ -115,8 +207,12 @@ func MakeCoordinator(servers []*labrpc.ClientEnd, respChan chan ResponseMsg) *Co
 	co := &Coordinator{
 		servers:  servers,
 		respChan: respChan,
-		// Initialize other fields here
+
+		active: make(map[int]bool),
 	}
+
+	//recover in the background, since the tester calls this while holding its own lock
+	go co.recover()
 
 	return co
 }
