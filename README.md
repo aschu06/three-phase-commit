@@ -21,25 +21,25 @@ This project implements a distributed transaction system using the Three-Phase C
 ## How to Run
 
 ### Prerequisites
-- Go installed (version 1.18+ recommended)
+- Go 1.22 or later
 
 ### Steps
 
+1. Clone the repository:
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/three-phase-commit.git
+git clone https://github.com/aschu06/three-phase-commit.git
 cd three-phase-commit
+```
 
-# Start servers (open separate terminals)
+2. Run the test suite with the race detector:
+```bash
+go test -race
+```
 
-# Coordinator
-go run main.go --role=coordinator --port=8000
-
-# Participant 1
-go run main.go --role=participant --id=1 --port=8001
-
-# Participant 2
-go run main.go --role=participant --id=2 --port=8002
+To run a single test, for example coordinator recovery:
+```bash
+go test -race -run TestRestartCommit
+```
 
 # Run a client transaction (in another terminal)
 go run client.go
